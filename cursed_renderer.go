@@ -86,11 +86,7 @@ func (s *cursedRenderer) setOptimizations(hardTabs, backspace, mapnl bool) {
 	s.hardTabs = hardTabs
 	s.backspace = backspace
 	s.mapnl = mapnl
-	if s.hardTabs {
-		s.scr.SetTabStops(s.width)
-	} else {
-		s.scr.SetTabStops(-1)
-	}
+	setTabStops(s, s.lastView != nil && s.lastView.AltScreen)
 	s.scr.SetBackspace(s.backspace)
 	s.scr.SetMapNewline(s.mapnl)
 	s.mu.Unlock()
@@ -659,15 +655,22 @@ func reset(s *cursedRenderer) {
 	scr.SetColorProfile(s.profile)
 	scr.SetRelativeCursor(true) // Always start in inline mode
 	scr.SetFullscreen(false)    // Always start in inline mode
-	if s.hardTabs {
-		scr.SetTabStops(s.width)
-	} else {
-		scr.SetTabStops(-1)
-	}
 	scr.SetBackspace(s.backspace)
 	scr.SetMapNewline(s.mapnl)
 	scr.SetScrollOptim(runtime.GOOS != "windows") // disable scroll optimization on Windows due to bugs in some terminals
 	s.scr = scr
+	setTabStops(s, false)
+}
+
+// setTabStops enables hard tabs in the alternate screen only. Inline rows end
+// up in the terminal's scrollback as painted, and a terminal keeps a tab that
+// moved the cursor there as a tab, so text copied back out would change.
+func setTabStops(s *cursedRenderer, altScreen bool) {
+	if s.hardTabs && altScreen {
+		s.scr.SetTabStops(s.width)
+	} else {
+		s.scr.SetTabStops(-1)
+	}
 }
 
 // setColorProfile implements renderer.
@@ -778,6 +781,7 @@ func enterAltScreen(s *cursedRenderer, write bool) {
 	}
 	s.scr.SetFullscreen(true)
 	s.scr.SetRelativeCursor(false)
+	setTabStops(s, true)
 	s.scr.Erase()
 }
 
@@ -785,6 +789,7 @@ func exitAltScreen(s *cursedRenderer, write bool) {
 	s.scr.Erase()
 	s.scr.SetRelativeCursor(true)
 	s.scr.SetFullscreen(false)
+	setTabStops(s, false)
 	if write {
 		s.buf.WriteString(ansi.ResetModeAltScreenSaveCursor)
 	}
@@ -891,6 +896,24 @@ func (s *cursedRenderer) insertAbove(str string) error {
 	}
 
 	return nil
+}
+
+// scrollUp implements renderer.
+func (s *cursedRenderer) scrollUp(rows int) bool {
+	// The same barrier as insertAbove: the rows scroll as the terminal shows
+	// them, so the queued view has to be on the terminal first.
+	if err := s.flush(false); err != nil {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastView == nil || s.lastView.AltScreen {
+		return false
+	}
+	// The line feeds stay in the screen writer's buffer, so they reach the
+	// terminal in the same write as the frame that fills the rows they free.
+	return s.scr.ScrollUp(rows)
 }
 
 // onMouse implements renderer.

@@ -784,6 +784,11 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				continue
 			}
 
+			// The renderer answers a scroll request before the model sees it.
+			if req, ok := msg.(scrollUpMsg); ok {
+				msg = ScrollUpMsg{Rows: req.rows, Scrolled: p.renderer.scrollUp(req.rows)}
+			}
+
 			// Handle special internal messages.
 			switch msg := msg.(type) {
 			case QuitMsg:

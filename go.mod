@@ -26,3 +26,5 @@ require (
 	github.com/xo/terminfo v1.0.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 )
+
+replace github.com/charmbracelet/ultraviolet => github.com/genai-io/ultraviolet v0.0.0-20261020172003-b2a673ac3e7c

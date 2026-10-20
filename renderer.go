@@ -34,6 +34,10 @@ type renderer interface {
 	// insertAbove inserts unmanaged lines above the renderer.
 	insertAbove(string) error
 
+	// scrollUp scrolls the top rows of a frame spanning the terminal into its
+	// scrollback, reporting whether it did.
+	scrollUp(int) bool
+
 	// setSyncdUpdates sets whether to use synchronized updates.
 	setSyncdUpdates(bool)
 
@@ -72,6 +76,32 @@ func Println(args ...any) Cmd {
 		return printLineMessage{
 			messageBody: fmt.Sprint(args...),
 		}
+	}
+}
+
+type scrollUpMsg struct {
+	rows int
+}
+
+// ScrollUpMsg reports the outcome of [ScrollUp]. When Scrolled is false
+// nothing was written and the rows are still at the top of the frame.
+type ScrollUpMsg struct {
+	Rows     int
+	Scrolled bool
+}
+
+// ScrollUp moves the top rows of an inline frame that spans the terminal into
+// the terminal's scrollback, the way output scrolls in a plain terminal: the
+// rows leave as they are already drawn, and the next frame paints only the rows
+// that scrolled in. It is for rows the program is about to drop from the top of
+// its view, so the view rendered when this runs must still show them there.
+//
+// The outcome arrives as a [ScrollUpMsg]. The scroll is refused when the frame
+// does not span the terminal, when the alternate screen is active, or while a
+// resize is being reconciled; the program then has to print the rows itself.
+func ScrollUp(rows int) Cmd {
+	return func() Msg {
+		return scrollUpMsg{rows: rows}
 	}
 }
 
