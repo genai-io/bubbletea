@@ -27,4 +27,4 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 )
 
-replace github.com/charmbracelet/ultraviolet => github.com/genai-io/ultraviolet v0.0.0-20261020172003-b2a673ac3e7c
+replace github.com/charmbracelet/ultraviolet => github.com/genai-io/ultraviolet v0.0.0-20261021080128-f26d6ca6a24b
