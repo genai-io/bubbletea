@@ -784,9 +784,19 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				continue
 			}
 
-			// The renderer answers a scroll request before the model sees it.
-			if req, ok := msg.(scrollUpMsg); ok {
-				msg = ScrollUpMsg{Rows: req.rows, Scrolled: p.renderer.scrollUp(req.rows)}
+			// The renderer answers its own requests before the model sees them.
+			switch req := msg.(type) {
+			case scrollUpMsg:
+				msg = ScrollUpMsg{Rows: req.rows, Scrolled: p.renderer.scrollUp(req.rows, req.width, req.height)}
+			case CursorPositionMsg:
+				if report, ok := p.renderer.cursorReport(req); ok {
+					msg = report
+				}
+			case resizeReportTimeoutMsg:
+				msg = p.renderer.expireResizeProbe(req.probe)
+			}
+			if msg == nil {
+				continue
 			}
 
 			// Handle special internal messages.
@@ -879,7 +889,12 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				continue
 
 			case WindowSizeMsg:
-				p.renderer.resize(msg.Width, msg.Height)
+				if report, probe := p.renderer.resize(msg.Width, msg.Height); probe > 0 {
+					p.executeQuery(ansi.RequestCursorPositionReport)
+					time.AfterFunc(resizeReportTimeout, func() { p.Send(resizeReportTimeoutMsg{probe}) })
+				} else {
+					go p.Send(report)
+				}
 
 			case windowSizeMsg:
 				go p.checkResize()
@@ -1123,7 +1138,7 @@ func (p *Program) Run() (returnModel Model, returnErr error) {
 
 	// Send the initial size to the program.
 	go p.Send(resizeMsg)
-	p.renderer.resize(resizeMsg.Width, resizeMsg.Height)
+	p.renderer.resize(resizeMsg.Width, resizeMsg.Height) // nothing drawn yet, so no probe
 
 	// Send the environment variables used by the program.
 	go p.Send(EnvMsg(p.environ))

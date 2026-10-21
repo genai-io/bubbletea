@@ -31,10 +31,13 @@ type cursedRenderer struct {
 	hardTabs      bool // whether to use hard tabs to optimize cursor movements
 	backspace     bool // whether to use backspace to optimize cursor movements
 	mapnl         bool
-	syncdUpdates  bool // whether to use synchronized output mode for updates
-	starting      bool // indicates whether the renderer is starting after being stopped
-	pendingErase  bool // an scr.Erase() is pending and hasn't been drained by flush yet
-	noInput       bool // whether input is disabled, in which case keyboard enhancement queries are pointless
+	syncdUpdates  bool             // whether to use synchronized output mode for updates
+	starting      bool             // indicates whether the renderer is starting after being stopped
+	pendingErase  bool             // an scr.Erase() is pending and hasn't been drained by flush yet
+	noInput       bool             // whether input is disabled, in which case keyboard enhancement queries are pointless
+	probe         *resizeProbe     // a resize waiting for the cursor report that measures it
+	probes        int              // resize probes issued, for their ids
+	unshipped     *unshippedScroll // a scroll still in buf, not yet sent to the terminal
 }
 
 var _ renderer = &cursedRenderer{}
@@ -266,6 +269,7 @@ func (s *cursedRenderer) close() (err error) {
 			return fmt.Errorf("bubbletea: error writing to screen: %w", err)
 		}
 		s.buf.Reset()
+		s.unshipped = nil
 	}
 
 	x, y := s.scr.Position()
@@ -292,6 +296,10 @@ func (s *cursedRenderer) writeString(str string) (int, error) {
 func (s *cursedRenderer) flush(closing bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.probe != nil && !closing {
+		// The redraw would move the cursor the pending report measures.
+		return nil
+	}
 
 	view := s.view
 	frameArea := uv.Rect(0, 0, s.width, s.height)
@@ -616,8 +624,9 @@ func (s *cursedRenderer) flush(closing bool) error {
 		_, _ = buf.WriteString(ansi.SetModeTextCursorEnable)
 	}
 
-	// Reset internal screen renderer buffer.
+	// Reset internal screen renderer buffer; what it held is on its way out.
 	s.buf.Reset()
+	s.unshipped = nil
 
 	// If our updates flush buffer has content, write it to the output writer.
 	if buf.Len() > 0 {
@@ -651,6 +660,7 @@ func (s *cursedRenderer) reset() {
 
 func reset(s *cursedRenderer) {
 	s.buf.Reset()
+	s.unshipped = nil
 	scr := uv.NewTerminalRenderer(&s.buf, s.env)
 	scr.SetColorProfile(s.profile)
 	scr.SetRelativeCursor(true) // Always start in inline mode
@@ -682,20 +692,136 @@ func (s *cursedRenderer) setColorProfile(p colorprofile.Profile) {
 }
 
 // resize implements renderer.
-func (s *cursedRenderer) resize(w, h int) {
+func (s *cursedRenderer) resize(w, h int) (Msg, int) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	scrolled := s.takeBackScroll()
+	probe := s.probeResize(scrolled)
+	if probe == 0 {
+		// Measured by the cursor report otherwise.
+		s.skipReflowedRows(w)
+	}
 	// We need to mark the screen for clear to force a redraw. However, we
 	// only do so if we're using alt screen or the width has changed.
 	// That's because redrawing is expensive and we can avoid it if the
 	// width hasn't changed in inline mode. On the other hand, when using
 	// alt screen mode, we always want to redraw because some terminals
 	// would scroll the screen and our content would be lost.
-	s.skipReflowedRows(w)
 	s.scr.Erase()
 	s.width, s.height = w, h
 	s.scr.Resize(s.width, s.height)
 	s.pendingErase = true
-	s.mu.Unlock()
+	if probe > 0 {
+		return nil, probe
+	}
+	return ResizeScrollbackMsg{Unscrolled: scrolled}, 0
+}
+
+// takeBackScroll drops a scroll the terminal has not been sent, returning the
+// rows it would have taken off the top.
+func (s *cursedRenderer) takeBackScroll() []string {
+	u := s.unshipped
+	if u == nil {
+		return nil
+	}
+	s.unshipped = nil
+	s.buf.Truncate(u.mark)
+	s.scr.SetPosition(u.x, u.y)
+	return u.lines
+}
+
+// probeResize keeps the frame on screen for measuring what this resize pushes
+// into scrollback, returning the probe's id, or 0 when it cannot be measured.
+// A frame that spans the terminal starts on its top row, so the cursor report
+// places it; a resize arriving before the last one was measured adds to the
+// same frame, since no redraw happens in between.
+func (s *cursedRenderer) probeResize(scrolled []string) int {
+	if s.noInput {
+		return 0
+	}
+	if s.probe == nil {
+		if s.lastView == nil || s.lastView.AltScreen {
+			return 0
+		}
+		lines := strings.Split(s.lastView.Content, "\n")
+		if len(lines) < s.height {
+			return 0
+		}
+		_, y := s.scr.Position()
+		drawn := make([]string, min(y, s.cellbuf.Height()))
+		for i := range drawn {
+			drawn[i] = drawnText(s.cellbuf.Line(i))
+		}
+		s.probe = &resizeProbe{lines: lines[len(lines)-s.height:], drawn: drawn, cursorRow: y, scrolled: scrolled}
+	}
+	s.probes++
+	s.probe.id = s.probes
+	s.probe.pending++
+	return s.probe.id
+}
+
+// placeFrameTop moves the cursor from where a resize left it to the top of the
+// frame for the redraw, which on its own moves up by the cursor's frame row
+// only, and returns how many frame rows the terminal pushed into scrollback.
+// The rows above the cursor rewrapped; y, when known, is the cursor's screen
+// row. Moving up stops at the top of the screen.
+func (s *cursedRenderer) placeFrameTop(probe *resizeProbe, y int, known bool) (pushed int) {
+	// GNU screen truncates rather than rewraps (see skipReflowedRows).
+	rewrap := uv.Environ(s.env).Getenv("STY") == ""
+	heights := rewrappedHeights(probe.drawn, s.width, rewrap)
+	above := 0
+	for _, h := range heights {
+		above += h
+	}
+	up := above - len(heights)
+	if known {
+		pushed = scrolledOff(heights, y)
+		if above >= y {
+			// Nothing above the frame is left on screen.
+			up = y
+		}
+	}
+	if up > 0 {
+		_, _ = s.scr.WriteString(ansi.CursorUp(up))
+	}
+	return pushed
+}
+
+// cursorReport implements renderer.
+func (s *cursedRenderer) cursorReport(pos CursorPositionMsg) (Msg, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.probe == nil {
+		return nil, false
+	}
+	s.probe.pending--
+	if s.probe.pending > 0 {
+		// A later resize moved the cursor again; its report measures both.
+		return nil, true
+	}
+	probe := s.probe
+	s.probe = nil
+	if probe.disturbed {
+		// Output moved the cursor after the resize, so the report does not
+		// place the frame.
+		s.placeFrameTop(probe, 0, false)
+		return ResizeScrollbackMsg{Unscrolled: probe.scrolled}, true
+	}
+	pushed := s.placeFrameTop(probe, pos.Y, true)
+	return resizeReport(probe.lines, pushed, probe.scrolled), true
+}
+
+// expireResizeProbe implements renderer.
+func (s *cursedRenderer) expireResizeProbe(id int) Msg {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.probe == nil || s.probe.id != id {
+		return nil
+	}
+	probe := s.probe
+	s.probe = nil
+	s.placeFrameTop(probe, 0, false)
+	return ResizeScrollbackMsg{Unscrolled: probe.scrolled}
 }
 
 // skipReflowedRows moves the cursor past the rows a narrowing terminal added to
@@ -847,6 +973,9 @@ func (s *cursedRenderer) insertAbove(str string) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.probe != nil {
+		s.probe.disturbed = true
+	}
 
 	var sb strings.Builder
 	w, h := s.cellbuf.Width(), s.cellbuf.Height()
@@ -899,7 +1028,7 @@ func (s *cursedRenderer) insertAbove(str string) error {
 }
 
 // scrollUp implements renderer.
-func (s *cursedRenderer) scrollUp(rows int) bool {
+func (s *cursedRenderer) scrollUp(rows, width, height int) bool {
 	// The same barrier as insertAbove: the rows scroll as the terminal shows
 	// them, so the queued view has to be on the terminal first.
 	if err := s.flush(false); err != nil {
@@ -908,12 +1037,24 @@ func (s *cursedRenderer) scrollUp(rows int) bool {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.lastView == nil || s.lastView.AltScreen {
+	if s.lastView == nil || s.lastView.AltScreen || width != s.width || height != s.height {
 		return false
 	}
-	// The line feeds stay in the screen writer's buffer, so they reach the
-	// terminal in the same write as the frame that fills the rows they free.
-	return s.scr.ScrollUp(rows)
+	// The line feeds stay in the buffer, so they reach the terminal in the same
+	// write as the frame that fills the rows they free. Until then a resize can
+	// take them back.
+	_ = s.scr.Flush()
+	u := &unshippedScroll{mark: s.buf.Len()}
+	u.x, u.y = s.scr.Position()
+	if !s.scr.ScrollUp(rows) {
+		return false
+	}
+	_ = s.scr.Flush()
+	lines := strings.Split(s.lastView.Content, "\n")
+	lines = lines[max(len(lines)-s.height, 0):]
+	u.lines = lines[:min(rows, len(lines))]
+	s.unshipped = u
+	return true
 }
 
 // onMouse implements renderer.

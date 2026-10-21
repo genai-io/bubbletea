@@ -36,7 +36,7 @@ type renderer interface {
 
 	// scrollUp scrolls the top rows of a frame spanning the terminal into its
 	// scrollback, reporting whether it did.
-	scrollUp(int) bool
+	scrollUp(rows, width, height int) bool
 
 	// setSyncdUpdates sets whether to use synchronized updates.
 	setSyncdUpdates(bool)
@@ -44,8 +44,20 @@ type renderer interface {
 	// setWidthMethod sets the method for calculating the width of the terminal.
 	setWidthMethod(ansi.Method)
 
-	// resize notify the renderer of a terminal resize.
-	resize(int, int)
+	// resize notify the renderer of a terminal resize, returning the
+	// ResizeScrollbackMsg to deliver, or a positive probe id instead: the
+	// renderer then waits for a cursor report to measure what the resize
+	// pushed into scrollback, and answers from cursorReport or
+	// expireResizeProbe.
+	resize(int, int) (Msg, int)
+
+	// cursorReport takes a cursor report the renderer asked for, returning
+	// the message to deliver in its place (nil for none) and whether it did.
+	cursorReport(CursorPositionMsg) (Msg, bool)
+
+	// expireResizeProbe gives up on the resize probe id once its cursor
+	// report is overdue, returning the message to deliver (nil for none).
+	expireResizeProbe(int) Msg
 
 	// setColorProfile sets the color profile.
 	setColorProfile(colorprofile.Profile)
@@ -80,7 +92,7 @@ func Println(args ...any) Cmd {
 }
 
 type scrollUpMsg struct {
-	rows int
+	rows, width, height int
 }
 
 // ScrollUpMsg reports the outcome of [ScrollUp]. When Scrolled is false
@@ -97,11 +109,13 @@ type ScrollUpMsg struct {
 // its view, so the view rendered when this runs must still show them there.
 //
 // The outcome arrives as a [ScrollUpMsg]. The scroll is refused when the frame
-// does not span the terminal, when the alternate screen is active, or while a
-// resize is being reconciled; the program then has to print the rows itself.
-func ScrollUp(rows int) Cmd {
+// does not span the terminal, when the alternate screen is active, while a
+// resize is being reconciled, or when the terminal is no longer width × height,
+// the size the rows were measured for; the program then has to print the rows
+// itself.
+func ScrollUp(rows, width, height int) Cmd {
 	return func() Msg {
-		return scrollUpMsg{rows: rows}
+		return scrollUpMsg{rows: rows, width: width, height: height}
 	}
 }
 

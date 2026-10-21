@@ -21,10 +21,16 @@ func (n nilRenderer) clearScreen() {}
 func (n nilRenderer) insertAbove(string) error { return nil }
 
 // scrollUp implements renderer.
-func (n nilRenderer) scrollUp(int) bool { return false }
+func (n nilRenderer) scrollUp(int, int, int) bool { return false }
 
 // resize implements renderer.
-func (n nilRenderer) resize(int, int) {}
+func (n nilRenderer) resize(int, int) (Msg, int) { return ResizeScrollbackMsg{}, 0 }
+
+// cursorReport implements renderer.
+func (n nilRenderer) cursorReport(CursorPositionMsg) (Msg, bool) { return nil, false }
+
+// expireResizeProbe implements renderer.
+func (n nilRenderer) expireResizeProbe(int) Msg { return nil }
 
 // setColorProfile implements renderer.
 func (n nilRenderer) setColorProfile(colorprofile.Profile) {}

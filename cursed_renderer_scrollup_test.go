@@ -19,7 +19,7 @@ func TestCursedRenderer_scrollUpShipsWithTheNextFrame(t *testing.T) {
 	}
 	out.Reset()
 
-	if !r.scrollUp(2) {
+	if !r.scrollUp(2, 10, 5) {
 		t.Fatal("a frame spanning the terminal must scroll")
 	}
 	if out.Len() != 0 {
@@ -52,14 +52,14 @@ func TestCursedRenderer_scrollUpRefusesShortFrameAndAltScreen(t *testing.T) {
 	if err := r.flush(false); err != nil {
 		t.Fatal(err)
 	}
-	if r.scrollUp(1) {
+	if r.scrollUp(1, 10, 5) {
 		t.Fatal("a frame shorter than the terminal cannot scroll its rows into history")
 	}
 
 	alt := NewView("r0\nr1\nr2\nr3\nr4")
 	alt.AltScreen = true
 	r.render(alt)
-	if r.scrollUp(1) {
+	if r.scrollUp(1, 10, 5) {
 		t.Fatal("the alternate screen has no scrollback to scroll into")
 	}
 }
